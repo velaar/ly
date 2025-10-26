@@ -1,1163 +1,347 @@
 const std = @import("std");
-const build_options = @import("build_options");
 const builtin = @import("builtin");
-const clap = @import("clap");
-const ini = @import("zigini");
-const auth = @import("auth.zig");
-const bigclock = @import("bigclock.zig");
-const enums = @import("enums.zig");
-const Environment = @import("Environment.zig");
 const interop = @import("interop.zig");
-const ColorMix = @import("animations/ColorMix.zig");
 const Doom = @import("animations/Doom.zig");
-const Dummy = @import("animations/Dummy.zig");
-const Matrix = @import("animations/Matrix.zig");
-const GameOfLife = @import("animations/GameOfLife.zig");
-const Animation = @import("tui/Animation.zig");
 const TerminalBuffer = @import("tui/TerminalBuffer.zig");
-const Session = @import("tui/components/Session.zig");
 const Text = @import("tui/components/Text.zig");
-const InfoLine = @import("tui/components/InfoLine.zig");
-const UserList = @import("tui/components/UserList.zig");
-const Config = @import("config/Config.zig");
-const Lang = @import("config/Lang.zig");
-const OldSave = @import("config/OldSave.zig");
-const SavedUsers = @import("config/SavedUsers.zig");
-const migrator = @import("config/migrator.zig");
-const SharedError = @import("SharedError.zig");
-const LogFile = @import("LogFile.zig");
 
-const StringList = std.ArrayListUnmanaged([]const u8);
-const Ini = ini.Ini;
-const DisplayServer = enums.DisplayServer;
-const Entry = Environment.Entry;
+const fb = if (builtin.os.tag == .linux)
+    @cImport({
+        @cInclude("linux/fb.h");
+    })
+else
+    struct {};
+
 const termbox = interop.termbox;
-const temporary_allocator = std.heap.page_allocator;
-const ly_version_str = "Ly version " ++ build_options.version;
 
-var session_pid: std.posix.pid_t = -1;
-fn signalHandler(i: c_int) callconv(.c) void {
-    if (session_pid == 0) return;
-
-    // Forward signal to session to clean up
-    if (session_pid > 0) {
-        _ = std.c.kill(session_pid, i);
-        var status: c_int = 0;
-        _ = std.c.waitpid(session_pid, &status, 0);
-    }
-
-    _ = termbox.tb_shutdown();
-    std.c.exit(i);
-}
-
-fn ttyControlTransferSignalHandler(_: c_int) callconv(.c) void {
-    _ = termbox.tb_shutdown();
-}
-
-const ConfigError = struct {
-    type_name: []const u8,
-    key: []const u8,
-    value: []const u8,
-    error_name: []const u8,
+const Colors = struct {
+    pub const fg: u32 = 0x00FFFFFF;
+    pub const bg: u32 = 0x00000000;
+    pub const border: u32 = 0x00FFFFFF;
+    pub const error: u32 = 0x01FF0000;
 };
-var config_errors: std.ArrayList(ConfigError) = .empty;
+
+const Hint = struct {
+    key: []const u8,
+    description: []const u8,
+};
+
+const hints = [_]Hint{
+    .{ .key = "F1", .description = "shutdown" },
+    .{ .key = "F2", .description = "restart" },
+    .{ .key = "F3", .description = "suspend" },
+    .{ .key = "F5", .description = "brightness-" },
+    .{ .key = "F6", .description = "brightness+" },
+};
+
+const SHUTDOWN_CMD = "/sbin/shutdown -a now";
+const RESTART_CMD = "/sbin/shutdown -r now";
+const SUSPEND_CMD: ?[]const u8 = "/bin/systemctl suspend";
+const BRIGHTNESS_DOWN_CMD = "brightnessctl -q -n s 10%-";
+const BRIGHTNESS_UP_CMD = "brightnessctl -q -n s +10%";
+
+const default_message = "Enter password to unlock";
+const unlocking_message = "Unlocking...";
+const spawn_error_message = "Failed to run unlocker";
+const unlock_failed_message = "Unlock failed";
+const suspend_failed_message = "Suspend command failed";
+const brightness_failed_message = "Brightness command failed";
+const input_error_message = "Input error";
+const empty_password_message = "Password required";
 
 pub fn main() !void {
-    var shutdown = false;
-    var restart = false;
-    var shutdown_cmd: []const u8 = undefined;
-    var restart_cmd: []const u8 = undefined;
-    var commands_allocated = false;
-
     var stderr_buffer: [128]u8 = undefined;
     var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
     var stderr = &stderr_writer.interface;
 
-    defer {
-        // If we can't shutdown or restart due to an error, we print it to standard error. If that fails, just bail out
-        if (shutdown) {
-            const shutdown_error = std.process.execv(temporary_allocator, &[_][]const u8{ "/bin/sh", "-c", shutdown_cmd });
-            stderr.print("error: couldn't shutdown: {s}\n", .{@errorName(shutdown_error)}) catch std.process.exit(1);
-            stderr.flush() catch std.process.exit(1);
-        } else if (restart) {
-            const restart_error = std.process.execv(temporary_allocator, &[_][]const u8{ "/bin/sh", "-c", restart_cmd });
-            stderr.print("error: couldn't restart: {s}\n", .{@errorName(restart_error)}) catch std.process.exit(1);
-            stderr.flush() catch std.process.exit(1);
-        } else {
-            // The user has quit Ly using Ctrl+C
-            if (commands_allocated) {
-                // Necessary if we error out before allocating
-                temporary_allocator.free(shutdown_cmd);
-                temporary_allocator.free(restart_cmd);
-            }
-        }
-    }
-
-    var gpa = std.heap.DebugAllocator(.{}).init;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-
-    // Allows stopping an animation after some time
-    const time_start = try interop.getTimeOfDay();
-    var animation_timed_out: bool = false;
-
     const allocator = gpa.allocator();
 
-    // Load arguments
-    const params = comptime clap.parseParamsComptime(
-        \\-h, --help                Shows all commands.
-        \\-v, --version             Shows the version of Ly.
-        \\-c, --config <str>        Overrides the default configuration path. Example: --config /usr/share/ly
-    );
-
-    var diag = clap.Diagnostic{};
-    var res = clap.parse(clap.Help, &params, clap.parsers.default, .{ .diagnostic = &diag, .allocator = allocator }) catch |err| {
-        diag.report(stderr, err) catch {};
-        try stderr.flush();
-        return err;
-    };
-    defer res.deinit();
-
-    var config: Config = undefined;
-    var lang: Lang = undefined;
-    var old_save_file_exists = false;
-    var maybe_config_load_error: ?anyerror = null;
-    var can_get_lock_state = true;
-    var can_draw_clock = true;
-    var can_draw_battery = true;
-
-    var saved_users = SavedUsers.init();
-    defer saved_users.deinit(allocator);
-
-    if (res.args.help != 0) {
-        try clap.help(stderr, clap.Help, &params, .{});
-
-        _ = try stderr.write("Note: if you want to configure Ly, please check the config file, which is located at " ++ build_options.config_directory ++ "/ly/config.ini.\n");
-        try stderr.flush();
-        std.process.exit(0);
+    const init_result = termbox.tb_init();
+    if (init_result != 0) {
+        try stderr.writeAll("failed to initialize termbox2\n");
+        return error.TermboxInitFailed;
     }
-    if (res.args.version != 0) {
-        _ = try stderr.write("Ly version " ++ build_options.version ++ "\n");
-        try stderr.flush();
-        std.process.exit(0);
-    }
-
-    // Load configuration file
-    var config_ini = Ini(Config).init(allocator);
-    defer config_ini.deinit();
-
-    var lang_ini = Ini(Lang).init(allocator);
-    defer lang_ini.deinit();
-
-    var old_save_ini = ini.Ini(OldSave).init(allocator);
-    defer old_save_ini.deinit();
-
-    var save_path: []const u8 = build_options.config_directory ++ "/ly/save.txt";
-    var old_save_path: []const u8 = build_options.config_directory ++ "/ly/save.ini";
-    var save_path_alloc = false;
+    defer redrawSplashOnExit();
     defer {
-        if (save_path_alloc) allocator.free(save_path);
-        if (save_path_alloc) allocator.free(old_save_path);
-    }
-
-    const comment_characters = "#";
-
-    if (res.args.config) |s| {
-        const trailing_slash = if (s[s.len - 1] != '/') "/" else "";
-
-        const config_path = try std.fmt.allocPrint(allocator, "{s}{s}config.ini", .{ s, trailing_slash });
-        defer allocator.free(config_path);
-
-        config = config_ini.readFileToStruct(config_path, .{
-            .fieldHandler = migrator.configFieldHandler,
-            .errorHandler = configErrorHandler,
-            .comment_characters = comment_characters,
-        }) catch |err| load_error: {
-            maybe_config_load_error = err;
-            break :load_error Config{};
-        };
-
-        const lang_path = try std.fmt.allocPrint(allocator, "{s}{s}lang/{s}.ini", .{ s, trailing_slash, config.lang });
-        defer allocator.free(lang_path);
-
-        lang = lang_ini.readFileToStruct(lang_path, .{
-            .fieldHandler = null,
-            .comment_characters = comment_characters,
-        }) catch Lang{};
-
-        if (config.save) {
-            save_path = try std.fmt.allocPrint(allocator, "{s}{s}save.txt", .{ s, trailing_slash });
-            old_save_path = try std.fmt.allocPrint(allocator, "{s}{s}save.ini", .{ s, trailing_slash });
-            save_path_alloc = true;
-        }
-    } else {
-        const config_path = build_options.config_directory ++ "/ly/config.ini";
-
-        config = config_ini.readFileToStruct(config_path, .{
-            .fieldHandler = migrator.configFieldHandler,
-            .errorHandler = configErrorHandler,
-            .comment_characters = comment_characters,
-        }) catch |err| load_error: {
-            maybe_config_load_error = err;
-            break :load_error Config{};
-        };
-
-        const lang_path = try std.fmt.allocPrint(allocator, "{s}/ly/lang/{s}.ini", .{ build_options.config_directory, config.lang });
-        defer allocator.free(lang_path);
-
-        lang = lang_ini.readFileToStruct(lang_path, .{
-            .fieldHandler = null,
-            .comment_characters = comment_characters,
-        }) catch Lang{};
-    }
-
-    if (maybe_config_load_error == null) {
-        migrator.lateConfigFieldHandler(&config);
-    }
-
-    var usernames = try getAllUsernames(allocator, config.login_defs_path);
-    defer {
-        for (usernames.items) |username| allocator.free(username);
-        usernames.deinit(allocator);
-    }
-
-    if (config.save) read_save_file: {
-        old_save_file_exists = migrator.tryMigrateIniSaveFile(allocator, &old_save_ini, old_save_path, &saved_users, usernames.items) catch break :read_save_file;
-
-        // Don't read the new save file if the old one still exists
-        if (old_save_file_exists) break :read_save_file;
-
-        var save_file = std.fs.cwd().openFile(save_path, .{}) catch break :read_save_file;
-        defer save_file.close();
-
-        var file_buffer: [256]u8 = undefined;
-        var file_reader = save_file.reader(&file_buffer);
-        var reader = &file_reader.interface;
-
-        const last_username_index_str = reader.takeDelimiterInclusive('\n') catch break :read_save_file;
-        saved_users.last_username_index = std.fmt.parseInt(usize, last_username_index_str[0..(last_username_index_str.len - 1)], 10) catch break :read_save_file;
-
-        while (reader.seek < reader.buffer.len) {
-            const line = reader.takeDelimiterInclusive('\n') catch break;
-
-            var user = std.mem.splitScalar(u8, line[0..(line.len - 1)], ':');
-            const username = user.next() orelse continue;
-            const session_index_str = user.next() orelse continue;
-
-            const session_index = std.fmt.parseInt(usize, session_index_str, 10) catch continue;
-
-            try saved_users.user_list.append(allocator, .{
-                .username = username,
-                .session_index = session_index,
-            });
-        }
-
-        // If no save file previously existed, fill it up with all usernames
-        if (saved_users.user_list.items.len > 0) break :read_save_file;
-
-        for (usernames.items) |user| {
-            try saved_users.user_list.append(allocator, .{
-                .username = user,
-                .session_index = 0,
-            });
-        }
-    }
-
-    var log_file_buffer: [1024]u8 = undefined;
-
-    var log_file = try LogFile.init(config.ly_log, &log_file_buffer);
-    defer log_file.deinit();
-
-    var log_writer = &log_file.file_writer.interface;
-
-    // These strings only end up getting freed if the user quits Ly using Ctrl+C, which is fine since in the other cases
-    // we end up shutting down or restarting the system
-    shutdown_cmd = try temporary_allocator.dupe(u8, config.shutdown_cmd);
-    restart_cmd = try temporary_allocator.dupe(u8, config.restart_cmd);
-    commands_allocated = true;
-
-    // Initialize termbox
-    try log_writer.writeAll("initializing termbox2\n");
-    _ = termbox.tb_init();
-    defer {
-        log_writer.writeAll("shutting down termbox2\n") catch {};
         _ = termbox.tb_shutdown();
     }
 
-    const act = std.posix.Sigaction{
-        .handler = .{ .handler = &signalHandler },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
-
-    if (config.full_color) {
-        _ = termbox.tb_set_output_mode(termbox.TB_OUTPUT_TRUECOLOR);
-        try log_writer.writeAll("termbox2 set to 24-bit color output mode\n");
-    } else {
-        try log_writer.writeAll("termbox2 set to eight-color output mode\n");
-    }
-
+    _ = termbox.tb_set_output_mode(termbox.TB_OUTPUT_TRUECOLOR);
     _ = termbox.tb_clear();
-
-    // Let's take some precautions here and clear the back buffer as well
     try ttyClearScreen();
 
-    // Needed to reset termbox after auth
-    const tb_termios = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
-
-    // Initialize terminal buffer
-    const labels_max_length = @max(lang.login.len, lang.password.len);
-
     var seed: u64 = undefined;
-    std.crypto.random.bytes(std.mem.asBytes(&seed)); // Get a random seed for the PRNG (used by animations)
-
+    std.crypto.random.bytes(std.mem.asBytes(&seed));
     var prng = std.Random.DefaultPrng.init(seed);
     const random = prng.random();
 
+    const labels_max_length = TerminalBuffer.strWidth("Password") catch 8;
     const buffer_options = TerminalBuffer.InitOptions{
-        .fg = config.fg,
-        .bg = config.bg,
-        .border_fg = config.border_fg,
-        .margin_box_h = config.margin_box_h,
-        .margin_box_v = config.margin_box_v,
-        .input_len = config.input_len,
+        .fg = Colors.fg,
+        .bg = Colors.bg,
+        .border_fg = Colors.border,
+        .margin_box_h = 2,
+        .margin_box_v = 1,
+        .input_len = 34,
     };
     var buffer = TerminalBuffer.init(buffer_options, labels_max_length, random);
 
-    try log_writer.print("screen resolution is {d}x{d}\n", .{ buffer.width, buffer.height });
-
-    // Initialize components
-    var info_line = InfoLine.init(allocator, &buffer);
-    defer info_line.deinit();
-
-    if (maybe_config_load_error) |err| {
-        // We can't localize this since the config failed to load so we'd fallback to the default language anyway
-        try info_line.addMessage("unable to parse config file", config.error_bg, config.error_fg);
-        try log_writer.print("unable to parse config file: {s}\n", .{@errorName(err)});
-
-        defer config_errors.deinit(temporary_allocator);
-
-        for (0..config_errors.items.len) |i| {
-            const config_error = config_errors.items[i];
-            defer {
-                temporary_allocator.free(config_error.type_name);
-                temporary_allocator.free(config_error.key);
-                temporary_allocator.free(config_error.value);
-            }
-
-            try log_writer.print("failed to convert value '{s}' of option '{s}' to type '{s}': {s}\n", .{ config_error.value, config_error.key, config_error.type_name, config_error.error_name });
-
-            // Flush immediately so we can free the allocated memory afterwards
-            try log_writer.flush();
-        }
-    }
-
-    if (!log_file.could_open_log_file) {
-        try info_line.addMessage(lang.err_log, config.error_bg, config.error_fg);
-        try log_writer.writeAll("failed to open log file\n");
-    }
-
-    interop.setNumlock(config.numlock) catch |err| {
-        try info_line.addMessage(lang.err_numlock, config.error_bg, config.error_fg);
-        try log_writer.print("failed to set numlock: {s}\n", .{@errorName(err)});
-    };
-
-    var login: UserList = undefined;
-
-    var session = Session.init(allocator, &buffer, &login);
-    defer session.deinit();
-
-    addOtherEnvironment(&session, lang, .shell, null) catch |err| {
-        try info_line.addMessage(lang.err_alloc, config.error_bg, config.error_fg);
-        try log_writer.print("failed to add shell environment: {s}\n", .{@errorName(err)});
-    };
-
-    if (build_options.enable_x11_support) {
-        if (config.xinitrc) |xinitrc_cmd| {
-            addOtherEnvironment(&session, lang, .xinitrc, xinitrc_cmd) catch |err| {
-                try info_line.addMessage(lang.err_alloc, config.error_bg, config.error_fg);
-                try log_writer.print("failed to add xinitrc environment: {s}\n", .{@errorName(err)});
-            };
-        }
-    } else {
-        try info_line.addMessage(lang.no_x11_support, config.bg, config.fg);
-        try log_writer.writeAll("x11 support disabled at compile-time\n");
-    }
-
-    if (config.initial_info_text) |text| {
-        try info_line.addMessage(text, config.bg, config.fg);
-    } else get_host_name: {
-        // Initialize information line with host name
-        var name_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
-        const hostname = std.posix.gethostname(&name_buf) catch |err| {
-            try info_line.addMessage(lang.err_hostname, config.error_bg, config.error_fg);
-            try log_writer.print("failed to get hostname: {s}\n", .{@errorName(err)});
-            break :get_host_name;
-        };
-        try info_line.addMessage(hostname, config.bg, config.fg);
-    }
-
-    // Crawl session directories (Wayland, X11 and custom respectively)
-    var wayland_session_dirs = std.mem.splitScalar(u8, config.waylandsessions, ':');
-    while (wayland_session_dirs.next()) |dir| {
-        try crawl(&session, lang, dir, .wayland);
-    }
-
-    if (build_options.enable_x11_support) {
-        var x_session_dirs = std.mem.splitScalar(u8, config.xsessions, ':');
-        while (x_session_dirs.next()) |dir| {
-            try crawl(&session, lang, dir, .x11);
-        }
-    }
-
-    var custom_session_dirs = std.mem.splitScalar(u8, config.custom_sessions, ':');
-    while (custom_session_dirs.next()) |dir| {
-        try crawl(&session, lang, dir, .custom);
-    }
-
-    if (usernames.items.len == 0) {
-        // If we have no usernames, simply add an error to the info line.
-        // This effectively means you can't login, since there would be no local
-        // accounts *and* no root account...but at this point, if that's the
-        // case, you have bigger problems to deal with in the first place. :D
-        try info_line.addMessage(lang.err_no_users, config.error_bg, config.error_fg);
-        try log_writer.writeAll("no users found\n");
-    }
-
-    login = try UserList.init(allocator, &buffer, usernames, &saved_users, &session);
-    defer login.deinit();
-
-    var password = Text.init(allocator, &buffer, true, config.asterisk);
-    defer password.deinit();
-
-    var active_input = config.default_input;
-    var insert_mode = !config.vi_mode or config.vi_default_mode == .insert;
-
-    // Load last saved username and desktop selection, if any
-    if (config.save) {
-        if (saved_users.last_username_index) |index| load_last_user: {
-            // If the saved index isn't valid, bail out
-            if (index >= saved_users.user_list.items.len) break :load_last_user;
-
-            const user = saved_users.user_list.items[index];
-
-            // Find user with saved name, and switch over to it
-            // If it doesn't exist (anymore), we don't change the value
-            for (usernames.items, 0..) |username, i| {
-                if (std.mem.eql(u8, username, user.username)) {
-                    login.label.current = i;
-                    break;
-                }
-            }
-
-            active_input = .password;
-
-            if (user.session_index < session.label.list.items.len) session.label.current = user.session_index;
-        }
-    }
-
-    // Place components on the screen
-    {
-        buffer.drawBoxCenter(!config.hide_borders, config.blank_box);
-
-        const coordinates = buffer.calculateComponentCoordinates();
-        info_line.label.position(coordinates.start_x, coordinates.y, coordinates.full_visible_length, null);
-        session.label.position(coordinates.x, coordinates.y + 2, coordinates.visible_length, config.text_in_center);
-        login.label.position(coordinates.x, coordinates.y + 4, coordinates.visible_length, config.text_in_center);
-        password.position(coordinates.x, coordinates.y + 6, coordinates.visible_length);
-
-        switch (active_input) {
-            .info_line => info_line.label.handle(null, insert_mode),
-            .session => session.label.handle(null, insert_mode),
-            .login => login.label.handle(null, insert_mode),
-            .password => password.handle(null, insert_mode) catch |err| {
-                try info_line.addMessage(lang.err_alloc, config.error_bg, config.error_fg);
-                try log_writer.print("failed to handle password input: {s}\n", .{@errorName(err)});
-            },
-        }
-    }
-
-    // Initialize the animation, if any
-    var animation: Animation = undefined;
-
-    switch (config.animation) {
-        .none => {
-            var dummy = Dummy{};
-            animation = dummy.animation();
-        },
-        .doom => {
-            var doom = try Doom.init(allocator, &buffer, config.doom_top_color, config.doom_middle_color, config.doom_bottom_color, config.doom_fire_height, config.doom_fire_spread);
-            animation = doom.animation();
-        },
-        .matrix => {
-            var matrix = try Matrix.init(allocator, &buffer, config.cmatrix_fg, config.cmatrix_head_col, config.cmatrix_min_codepoint, config.cmatrix_max_codepoint);
-            animation = matrix.animation();
-        },
-        .colormix => {
-            var color_mix = ColorMix.init(&buffer, config.colormix_col1, config.colormix_col2, config.colormix_col3);
-            animation = color_mix.animation();
-        },
-        .gameoflife => {
-            var game_of_life = try GameOfLife.init(allocator, &buffer, config.gameoflife_fg, config.gameoflife_entropy_interval, config.gameoflife_frame_delay, config.gameoflife_initial_density);
-            animation = game_of_life.animation();
-        },
-    }
+    var doom = try Doom.init(allocator, &buffer, 0x00FF0000, 0x00FFFF00, 0x00FFFFFF, 6, 2);
+    var animation = doom.animation();
     defer animation.deinit();
 
-    const animate = config.animation != .none;
-    const shutdown_key = try std.fmt.parseInt(u8, config.shutdown_key[1..], 10);
-    const shutdown_len = try TerminalBuffer.strWidth(lang.shutdown);
-    const restart_key = try std.fmt.parseInt(u8, config.restart_key[1..], 10);
-    const restart_len = try TerminalBuffer.strWidth(lang.restart);
-    const sleep_key = try std.fmt.parseInt(u8, config.sleep_key[1..], 10);
-    const sleep_len = try TerminalBuffer.strWidth(lang.sleep);
-    const brightness_down_key = if (config.brightness_down_key) |key| try std.fmt.parseInt(u8, key[1..], 10) else null;
-    const brightness_down_len = try TerminalBuffer.strWidth(lang.brightness_down);
-    const brightness_up_key = if (config.brightness_up_key) |key| try std.fmt.parseInt(u8, key[1..], 10) else null;
-    const brightness_up_len = try TerminalBuffer.strWidth(lang.brightness_up);
+    var password = Text.init(allocator, &buffer, true, '*');
+    defer {
+        wipePassword(&password);
+        password.deinit();
+    }
+
+    var message_text: []const u8 = default_message;
+    var message_fg: u32 = Colors.fg;
+    var message_bg: u32 = Colors.bg;
+    var pending_action: ?[]const u8 = null;
+    var pending_unlock = false;
+    var unlock_buffer: ?[]u8 = null;
 
     var event: termbox.tb_event = undefined;
-    var run = true;
-    var update = true;
-    var resolution_changed = false;
-    var auth_fails: u64 = 0;
+    var running = true;
 
-    // Switch to selected TTY
-    const active_tty = interop.getActiveTty(allocator) catch |err| no_tty_found: {
-        try info_line.addMessage(lang.err_get_active_tty, config.error_bg, config.error_fg);
-        try log_writer.print("failed to get active tty: {s}\n", .{@errorName(err)});
-        break :no_tty_found build_options.fallback_tty;
-    };
-    interop.switchTty(active_tty) catch |err| {
-        try info_line.addMessage(lang.err_switch_tty, config.error_bg, config.error_fg);
-        try log_writer.print("failed to switch tty: {s}\n", .{@errorName(err)});
-    };
+    while (running) {
+        animation.draw();
 
-    while (run) {
-        // If there's no input or there's an animation, a resolution change needs to be checked
-        if (!update or animate) {
-            if (!update) std.Thread.sleep(std.time.ns_per_ms * 100);
+        buffer.drawBoxCenter(true, true);
+        drawHints(&buffer);
 
-            _ = termbox.tb_present(); // Required to update tb_width() and tb_height()
+        const coordinates = buffer.calculateComponentCoordinates();
+        const message_y = coordinates.y;
+        const input_y = coordinates.y + 2;
 
-            const width: usize = @intCast(termbox.tb_width());
-            const height: usize = @intCast(termbox.tb_height());
+        clearLine(&buffer, coordinates.start_x, message_y, coordinates.full_visible_length);
+        drawMessage(message_text, message_fg, message_bg, &buffer, coordinates.start_x, message_y, coordinates.full_visible_length);
 
-            if (width != buffer.width or height != buffer.height) {
-                // If it did change, then update the cell buffer, reallocate the current animation's buffers, and force a draw update
-                try log_writer.print("screen resolution updated to {d}x{d}\n", .{ width, height });
+        clearLine(&buffer, coordinates.start_x, input_y, coordinates.full_visible_length);
+        buffer.drawLabel("Password", coordinates.start_x, input_y);
+        password.position(coordinates.x, input_y, coordinates.visible_length);
+        password.draw();
+        password.handle(null, true) catch {
+            message_text = input_error_message;
+            message_fg = Colors.error;
+            message_bg = Colors.bg;
+        };
 
-                buffer.width = width;
-                buffer.height = height;
+        _ = termbox.tb_present();
 
-                animation.realloc() catch |err| {
-                    try info_line.addMessage(lang.err_alloc, config.error_bg, config.error_fg);
-                    try log_writer.print("failed to reallocate animation buffers: {s}\n", .{@errorName(err)});
+        if (pending_unlock) {
+            if (unlock_buffer) |slice| {
+                const unlock_ok = runUnlock(allocator, slice) catch {
+                    message_text = spawn_error_message;
+                    message_fg = Colors.error;
+                    message_bg = Colors.bg;
+                    wipeSecret(slice);
+                    allocator.free(slice);
+                    unlock_buffer = null;
+                    pending_unlock = false;
+                    continue;
                 };
 
-                update = true;
-                resolution_changed = true;
+                if (unlock_ok) {
+                    wipeSecret(slice);
+                    allocator.free(slice);
+                    return;
+                }
+
+                message_text = unlock_failed_message;
+                message_fg = Colors.error;
+                message_bg = Colors.bg;
+
+                wipeSecret(slice);
+                allocator.free(slice);
+                unlock_buffer = null;
             }
+
+            pending_unlock = false;
+            continue;
         }
 
-        if (update) {
-            // If the user entered a wrong password 10 times in a row, play a cascade animation, else update normally
-            if (auth_fails >= config.auth_fails) {
-                std.Thread.sleep(std.time.ns_per_ms * 10);
-                update = buffer.cascade();
+        const event_result = termbox.tb_peek_event(&event, 50);
+        if (event_result == 0) continue;
+        if (event_result < 0) continue;
 
-                if (!update) {
-                    std.Thread.sleep(std.time.ns_per_s * 7);
-                    auth_fails = 0;
-                }
-
-                _ = termbox.tb_present();
-                continue;
-            }
-
-            _ = termbox.tb_clear();
-
-            var length: usize = 0;
-
-            if (!animation_timed_out) animation.draw();
-
-            if (!config.hide_version_string) {
-                buffer.drawLabel(ly_version_str, 0, buffer.height - 1);
-            }
-
-            if (config.battery_id) |id| draw_battery: {
-                if (!can_draw_battery) break :draw_battery;
-
-                const battery_percentage = getBatteryPercentage(id) catch |err| {
-                    try log_writer.print("failed to get battery percentage: {s}\n", .{@errorName(err)});
-                    try info_line.addMessage(lang.err_battery, config.error_bg, config.error_fg);
-                    can_draw_battery = false;
-                    break :draw_battery;
-                };
-
-                var battery_buf: [16:0]u8 = undefined;
-                const battery_str = std.fmt.bufPrintZ(&battery_buf, "BAT: {d}%", .{battery_percentage}) catch break :draw_battery;
-
-                const battery_y: usize = if (config.hide_key_hints) 0 else 1;
-                buffer.drawLabel(battery_str, 0, battery_y);
-                can_draw_battery = true;
-            }
-
-            if (config.bigclock != .none and buffer.box_height + (bigclock.HEIGHT + 2) * 2 < buffer.height) {
-                var format_buf: [16:0]u8 = undefined;
-                var clock_buf: [32:0]u8 = undefined;
-                // We need the slice/c-string returned by `bufPrintZ`.
-                const format = try std.fmt.bufPrintZ(&format_buf, "{s}{s}{s}{s}", .{
-                    if (config.bigclock_12hr) "%I" else "%H",
-                    ":%M",
-                    if (config.bigclock_seconds) ":%S" else "",
-                    if (config.bigclock_12hr) "%P" else "",
-                });
-                const xo = buffer.width / 2 - @min(buffer.width, (format.len * (bigclock.WIDTH + 1))) / 2;
-                const yo = (buffer.height - buffer.box_height) / 2 - bigclock.HEIGHT - 2;
-
-                const clock_str = interop.timeAsString(&clock_buf, format);
-
-                for (clock_str, 0..) |c, i| {
-                    // TODO: Show error
-                    const clock_cell = try bigclock.clockCell(animate, c, buffer.fg, buffer.bg, config.bigclock);
-                    bigclock.alphaBlit(xo + i * (bigclock.WIDTH + 1), yo, buffer.width, buffer.height, clock_cell);
-                }
-            }
-
-            buffer.drawBoxCenter(!config.hide_borders, config.blank_box);
-
-            if (resolution_changed) {
-                const coordinates = buffer.calculateComponentCoordinates();
-                info_line.label.position(coordinates.start_x, coordinates.y, coordinates.full_visible_length, null);
-                session.label.position(coordinates.x, coordinates.y + 2, coordinates.visible_length, config.text_in_center);
-                login.label.position(coordinates.x, coordinates.y + 4, coordinates.visible_length, config.text_in_center);
-                password.position(coordinates.x, coordinates.y + 6, coordinates.visible_length);
-
-                resolution_changed = false;
-            }
-
-            switch (active_input) {
-                .info_line => info_line.label.handle(null, insert_mode),
-                .session => session.label.handle(null, insert_mode),
-                .login => login.label.handle(null, insert_mode),
-                .password => password.handle(null, insert_mode) catch |err| {
-                    try info_line.addMessage(lang.err_alloc, config.error_bg, config.error_fg);
-                    try log_writer.print("failed to handle password input: {s}\n", .{@errorName(err)});
-                },
-            }
-
-            if (config.clock) |clock| draw_clock: {
-                if (!can_draw_clock) break :draw_clock;
-
-                var clock_buf: [64:0]u8 = undefined;
-                const clock_str = interop.timeAsString(&clock_buf, clock);
-
-                if (clock_str.len == 0) {
-                    try info_line.addMessage(lang.err_clock_too_long, config.error_bg, config.error_fg);
-                    can_draw_clock = false;
-                    try log_writer.writeAll("clock string too long\n");
-                    break :draw_clock;
-                }
-
-                buffer.drawLabel(clock_str, buffer.width - @min(buffer.width, clock_str.len), 0);
-            }
-
-            const label_x = buffer.box_x + buffer.margin_box_h;
-            const label_y = buffer.box_y + buffer.margin_box_v;
-
-            buffer.drawLabel(lang.login, label_x, label_y + 4);
-            buffer.drawLabel(lang.password, label_x, label_y + 6);
-
-            info_line.label.draw();
-
-            if (!config.hide_key_hints) {
-                buffer.drawLabel(config.shutdown_key, length, 0);
-                length += config.shutdown_key.len + 1;
-                buffer.drawLabel(" ", length - 1, 0);
-
-                buffer.drawLabel(lang.shutdown, length, 0);
-                length += shutdown_len + 1;
-
-                buffer.drawLabel(config.restart_key, length, 0);
-                length += config.restart_key.len + 1;
-                buffer.drawLabel(" ", length - 1, 0);
-
-                buffer.drawLabel(lang.restart, length, 0);
-                length += restart_len + 1;
-
-                if (config.sleep_cmd != null) {
-                    buffer.drawLabel(config.sleep_key, length, 0);
-                    length += config.sleep_key.len + 1;
-                    buffer.drawLabel(" ", length - 1, 0);
-
-                    buffer.drawLabel(lang.sleep, length, 0);
-                    length += sleep_len + 1;
-                }
-
-                if (config.brightness_down_key) |key| {
-                    buffer.drawLabel(key, length, 0);
-                    length += key.len + 1;
-                    buffer.drawLabel(" ", length - 1, 0);
-
-                    buffer.drawLabel(lang.brightness_down, length, 0);
-                    length += brightness_down_len + 1;
-                }
-
-                if (config.brightness_up_key) |key| {
-                    buffer.drawLabel(key, length, 0);
-                    length += key.len + 1;
-                    buffer.drawLabel(" ", length - 1, 0);
-
-                    buffer.drawLabel(lang.brightness_up, length, 0);
-                    length += brightness_up_len + 1;
-                }
-            }
-
-            if (config.box_title) |title| {
-                buffer.drawConfinedLabel(title, buffer.box_x, buffer.box_y - 1, buffer.box_width);
-            }
-
-            if (config.vi_mode) {
-                const label_txt = if (insert_mode) lang.insert else lang.normal;
-                buffer.drawLabel(label_txt, buffer.box_x, buffer.box_y + buffer.box_height);
-            }
-
-            if (can_get_lock_state) draw_lock_state: {
-                const lock_state = interop.getLockState() catch |err| {
-                    try info_line.addMessage(lang.err_lock_state, config.error_bg, config.error_fg);
-                    can_get_lock_state = false;
-                    try log_writer.print("failed to get lock state: {s}\n", .{@errorName(err)});
-                    break :draw_lock_state;
-                };
-
-                var lock_state_x = buffer.width - @min(buffer.width, lang.numlock.len);
-                const lock_state_y: usize = if (config.clock != null) 1 else 0;
-
-                if (lock_state.numlock) buffer.drawLabel(lang.numlock, lock_state_x, lock_state_y);
-
-                if (lock_state_x >= lang.capslock.len + 1) {
-                    lock_state_x -= lang.capslock.len + 1;
-                    if (lock_state.capslock) buffer.drawLabel(lang.capslock, lock_state_x, lock_state_y);
-                }
-            }
-
-            session.label.draw();
-            login.label.draw();
-            password.draw();
-
-            _ = termbox.tb_present();
+        if (event.type == termbox.TB_EVENT_RESIZE) {
+            buffer = TerminalBuffer.init(buffer_options, labels_max_length, random);
+            animation.realloc() catch {};
+            continue;
         }
 
-        var timeout: i32 = -1;
+        if (event.type != termbox.TB_EVENT_KEY) continue;
 
-        // Calculate the maximum timeout based on current animations, or the (big) clock. If there's none, we wait for the event indefinitely instead
-        if (animate and !animation_timed_out) {
-            timeout = config.min_refresh_delta;
-
-            // Check how long we've been running so we can turn off the animation
-            const time = try interop.getTimeOfDay();
-
-            if (config.animation_timeout_sec > 0 and time.seconds - time_start.seconds > config.animation_timeout_sec) {
-                animation_timed_out = true;
-                animation.deinit();
-            }
-        } else if (config.bigclock != .none and config.clock == null) {
-            const time = try interop.getTimeOfDay();
-
-            timeout = @intCast((60 - @rem(time.seconds, 60)) * 1000 - @divTrunc(time.microseconds, 1000) + 1);
-        } else if (config.clock != null or auth_fails >= config.auth_fails) {
-            const time = try interop.getTimeOfDay();
-
-            timeout = @intCast(1000 - @divTrunc(time.microseconds, 1000) + 1);
-        }
-
-        const event_error = if (timeout == -1) termbox.tb_poll_event(&event) else termbox.tb_peek_event(&event, timeout);
-
-        update = timeout != -1;
-
-        if (event_error < 0 or event.type != termbox.TB_EVENT_KEY) continue;
-
+        var handled = false;
         switch (event.key) {
-            termbox.TB_KEY_ESC => {
-                if (config.vi_mode and insert_mode) {
-                    insert_mode = false;
-                    update = true;
-                }
+            termbox.TB_KEY_CTRL_C => {
+                handled = true;
+                running = false;
             },
-            termbox.TB_KEY_F12...termbox.TB_KEY_F1 => {
-                const pressed_key = 0xFFFF - event.key + 1;
-                if (pressed_key == shutdown_key) {
-                    shutdown = true;
-                    run = false;
-                } else if (pressed_key == restart_key) {
-                    restart = true;
-                    run = false;
-                } else if (pressed_key == sleep_key) {
-                    if (config.sleep_cmd) |sleep_cmd| {
-                        var sleep = std.process.Child.init(&[_][]const u8{ "/bin/sh", "-c", sleep_cmd }, allocator);
-                        sleep.stdout_behavior = .Ignore;
-                        sleep.stderr_behavior = .Ignore;
-
-                        handle_sleep_cmd: {
-                            const process_result = sleep.spawnAndWait() catch {
-                                break :handle_sleep_cmd;
-                            };
-                            if (process_result.Exited != 0) {
-                                try info_line.addMessage(lang.err_sleep, config.error_bg, config.error_fg);
-                                try log_writer.print("failed to execute sleep command: exit code {d}\n", .{process_result.Exited});
-                            }
-                        }
-                    }
-                } else if (brightness_down_key != null and pressed_key == brightness_down_key.?) {
-                    adjustBrightness(allocator, config.brightness_down_cmd) catch |err| {
-                        try info_line.addMessage(lang.err_brightness_change, config.error_bg, config.error_fg);
-                        try log_writer.print("failed to change brightness: {s}\n", .{@errorName(err)});
-                    };
-                } else if (brightness_up_key != null and pressed_key == brightness_up_key.?) {
-                    adjustBrightness(allocator, config.brightness_up_cmd) catch |err| {
-                        try info_line.addMessage(lang.err_brightness_change, config.error_bg, config.error_fg);
-                        try log_writer.print("failed to change brightness: {s}\n", .{@errorName(err)});
+            termbox.TB_KEY_F1 => {
+                handled = true;
+                pending_action = SHUTDOWN_CMD;
+                running = false;
+            },
+            termbox.TB_KEY_F2 => {
+                handled = true;
+                pending_action = RESTART_CMD;
+                running = false;
+            },
+            termbox.TB_KEY_F3 => {
+                handled = true;
+                if (SUSPEND_CMD) |cmd| {
+                    runCommand(cmd) catch {
+                        message_text = suspend_failed_message;
+                        message_fg = Colors.error;
+                        message_bg = Colors.bg;
                     };
                 }
             },
-            termbox.TB_KEY_CTRL_C => run = false,
-            termbox.TB_KEY_CTRL_U => if (active_input == .password) {
-                password.clear();
-                update = true;
-            },
-            termbox.TB_KEY_CTRL_K, termbox.TB_KEY_ARROW_UP => {
-                active_input = switch (active_input) {
-                    .session, .info_line => .info_line,
-                    .login => .session,
-                    .password => .login,
+            termbox.TB_KEY_F5 => {
+                handled = true;
+                adjustBrightness(allocator, BRIGHTNESS_DOWN_CMD) catch {
+                    message_text = brightness_failed_message;
+                    message_fg = Colors.error;
+                    message_bg = Colors.bg;
                 };
-                update = true;
             },
-            termbox.TB_KEY_CTRL_J, termbox.TB_KEY_ARROW_DOWN => {
-                active_input = switch (active_input) {
-                    .info_line => .session,
-                    .session => .login,
-                    .login, .password => .password,
+            termbox.TB_KEY_F6 => {
+                handled = true;
+                adjustBrightness(allocator, BRIGHTNESS_UP_CMD) catch {
+                    message_text = brightness_failed_message;
+                    message_fg = Colors.error;
+                    message_bg = Colors.bg;
                 };
-                update = true;
             },
-            termbox.TB_KEY_TAB => {
-                active_input = switch (active_input) {
-                    .info_line => .session,
-                    .session => .login,
-                    .login => .password,
-                    .password => .info_line,
+            termbox.TB_KEY_CTRL_U => {
+                handled = true;
+                wipePassword(&password);
+            },
+            termbox.TB_KEY_ENTER => {
+                handled = true;
+                const slice = password.text.items[0..password.end];
+                if (slice.len == 0) {
+                    message_text = empty_password_message;
+                    message_fg = Colors.error;
+                    message_bg = Colors.bg;
+                    continue;
+                }
+
+                unlock_buffer = allocator.dupe(u8, slice) catch {
+                    message_text = spawn_error_message;
+                    message_fg = Colors.error;
+                    message_bg = Colors.bg;
+                    continue;
                 };
-                update = true;
+                message_text = unlocking_message;
+                message_fg = Colors.fg;
+                message_bg = Colors.bg;
+                pending_unlock = true;
+                wipePassword(&password);
+                continue;
             },
-            termbox.TB_KEY_BACK_TAB => {
-                active_input = switch (active_input) {
-                    .info_line => .password,
-                    .session => .info_line,
-                    .login => .session,
-                    .password => .login,
-                };
-                update = true;
-            },
-            termbox.TB_KEY_ENTER => authenticate: {
-                try log_writer.writeAll("authenticating...\n");
-
-                if (!config.allow_empty_password and password.text.items.len == 0) {
-                    // Let's not log this message for security reasons
-                    try info_line.addMessage(lang.err_empty_password, config.error_bg, config.error_fg);
-                    InfoLine.clearRendered(allocator, buffer) catch |err| {
-                        try info_line.addMessage(lang.err_alloc, config.error_bg, config.error_fg);
-                        try log_writer.print("failed to clear info line: {s}\n", .{@errorName(err)});
-                    };
-                    info_line.label.draw();
-                    _ = termbox.tb_present();
-                    break :authenticate;
-                }
-
-                try info_line.addMessage(lang.authenticating, config.bg, config.fg);
-                InfoLine.clearRendered(allocator, buffer) catch |err| {
-                    try info_line.addMessage(lang.err_alloc, config.error_bg, config.error_fg);
-                    try log_writer.print("failed to clear info line: {s}\n", .{@errorName(err)});
-                };
-                info_line.label.draw();
-                _ = termbox.tb_present();
-
-                if (config.save) save_last_settings: {
-                    // It isn't worth cluttering the code with precise error
-                    // handling, so let's just report a generic error message,
-                    // that should be good enough for debugging anyway.
-                    errdefer log_writer.writeAll("failed to save current user data\n") catch {};
-
-                    var file = std.fs.cwd().createFile(save_path, .{}) catch |err| {
-                        log_writer.print("failed to create save file: {s}\n", .{@errorName(err)}) catch break :save_last_settings;
-                        break :save_last_settings;
-                    };
-                    defer file.close();
-
-                    var file_buffer: [256]u8 = undefined;
-                    var file_writer = file.writer(&file_buffer);
-                    var writer = &file_writer.interface;
-
-                    try writer.print("{d}\n", .{login.label.current});
-                    for (saved_users.user_list.items) |user| {
-                        try writer.print("{s}:{d}\n", .{ user.username, user.session_index });
-                    }
-                    try writer.flush();
-
-                    // Delete previous save file if it exists
-                    if (migrator.maybe_save_file) |path| {
-                        std.fs.cwd().deleteFile(path) catch {};
-                    } else if (old_save_file_exists) {
-                        std.fs.cwd().deleteFile(old_save_path) catch {};
-                    }
-                }
-
-                var shared_err = try SharedError.init();
-                defer shared_err.deinit();
-
-                {
-                    log_file.deinit();
-
-                    session_pid = try std.posix.fork();
-                    if (session_pid == 0) {
-                        const current_environment = session.label.list.items[session.label.current].environment;
-                        const auth_options = auth.AuthOptions{
-                            .tty = active_tty,
-                            .service_name = config.service_name,
-                            .path = config.path,
-                            .session_log = config.session_log,
-                            .xauth_cmd = config.xauth_cmd,
-                            .setup_cmd = config.setup_cmd,
-                            .login_cmd = config.login_cmd,
-                            .x_cmd = config.x_cmd,
-                            .session_pid = session_pid,
-                        };
-
-                        // Signal action to give up control on the TTY
-                        const tty_control_transfer_act = std.posix.Sigaction{
-                            .handler = .{ .handler = &ttyControlTransferSignalHandler },
-                            .mask = std.posix.sigemptyset(),
-                            .flags = 0,
-                        };
-                        std.posix.sigaction(std.posix.SIG.CHLD, &tty_control_transfer_act, null);
-
-                        try log_file.reinit();
-
-                        auth.authenticate(allocator, &log_file, auth_options, current_environment, login.getCurrentUsername(), password.text.items) catch |err| {
-                            shared_err.writeError(err);
-
-                            log_file.deinit();
-                            std.process.exit(1);
-                        };
-
-                        log_file.deinit();
-                        std.process.exit(0);
-                    }
-
-                    _ = std.posix.waitpid(session_pid, 0);
-                    // HACK: It seems like the session process is not exiting immediately after the waitpid call.
-                    // This is a workaround to ensure the session process has exited before re-initializing the TTY.
-                    std.Thread.sleep(std.time.ns_per_s * 1);
-                    session_pid = -1;
-
-                    try log_file.reinit();
-                }
-
-                // Take back control of the TTY
-                _ = termbox.tb_init();
-
-                if (config.full_color) {
-                    _ = termbox.tb_set_output_mode(termbox.TB_OUTPUT_TRUECOLOR);
-                }
-
-                const auth_err = shared_err.readError();
-                if (auth_err) |err| {
-                    auth_fails += 1;
-                    active_input = .password;
-
-                    try info_line.addMessage(getAuthErrorMsg(err, lang), config.error_bg, config.error_fg);
-                    try log_writer.print("failed to authenticate: {s}\n", .{@errorName(err)});
-
-                    if (config.clear_password or err != error.PamAuthError) password.clear();
-                } else {
-                    if (config.logout_cmd) |logout_cmd| {
-                        var logout_process = std.process.Child.init(&[_][]const u8{ "/bin/sh", "-c", logout_cmd }, allocator);
-                        _ = logout_process.spawnAndWait() catch .{};
-                    }
-
-                    password.clear();
-                    try info_line.addMessage(lang.logout, config.bg, config.fg);
-                    try log_writer.writeAll("logged out\n");
-                }
-
-                try std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, tb_termios);
-
-                if (auth_fails < config.auth_fails) {
-                    _ = termbox.tb_clear();
-                    try ttyClearScreen();
-
-                    update = true;
-                }
-
-                // Restore the cursor
-                _ = termbox.tb_set_cursor(0, 0);
-                _ = termbox.tb_present();
-            },
-            else => {
-                if (!insert_mode) {
-                    switch (event.ch) {
-                        'k' => {
-                            active_input = switch (active_input) {
-                                .session, .info_line => .info_line,
-                                .login => .session,
-                                .password => .login,
-                            };
-                            update = true;
-                            continue;
-                        },
-                        'j' => {
-                            active_input = switch (active_input) {
-                                .info_line => .session,
-                                .session => .login,
-                                .login, .password => .password,
-                            };
-                            update = true;
-                            continue;
-                        },
-                        'i' => {
-                            insert_mode = true;
-                            update = true;
-                            continue;
-                        },
-                        else => {},
-                    }
-                }
-
-                switch (active_input) {
-                    .info_line => info_line.label.handle(&event, insert_mode),
-                    .session => session.label.handle(&event, insert_mode),
-                    .login => login.label.handle(&event, insert_mode),
-                    .password => password.handle(&event, insert_mode) catch {
-                        try info_line.addMessage(lang.err_alloc, config.error_bg, config.error_fg);
-                    },
-                }
-                update = true;
-            },
+            else => {},
         }
 
-        try log_writer.flush();
+        if (!handled) {
+            password.handle(&event, true) catch {
+                message_text = input_error_message;
+                message_fg = Colors.error;
+                message_bg = Colors.bg;
+            };
+        }
+    }
+
+    if (pending_action) |cmd| {
+        const argv = [_][]const u8{ "/bin/sh", "-c", cmd };
+        std.process.execv(std.heap.page_allocator, &argv) catch |err| {
+            stderr.print("failed to run {s}: {s}\n", .{ cmd, @errorName(err) }) catch {};
+        };
     }
 }
 
-fn configErrorHandler(type_name: []const u8, key: []const u8, value: []const u8, err: anyerror) void {
-    config_errors.append(temporary_allocator, .{
-        .type_name = temporary_allocator.dupe(u8, type_name) catch return,
-        .key = temporary_allocator.dupe(u8, key) catch return,
-        .value = temporary_allocator.dupe(u8, value) catch return,
-        .error_name = @errorName(err),
-    }) catch return;
+fn drawMessage(text: []const u8, fg: u32, bg: u32, buffer: *TerminalBuffer, x: usize, y: usize, max_width: usize) void {
+    if (text.len == 0 or max_width == 0) return;
+    const width = TerminalBuffer.strWidth(text) catch 0;
+    if (width == 0) return;
+    if (width >= max_width) {
+        buffer.drawConfinedLabel(text, x, y, max_width);
+        return;
+    }
+    const offset = (max_width - width) / 2;
+    TerminalBuffer.drawColorLabel(text, x + offset, y, fg, bg);
 }
 
-fn ttyClearScreen() !void {
-    // Clear the TTY because termbox2 doesn't seem to do it properly
-    const capability = termbox.global.caps[termbox.TB_CAP_CLEAR_SCREEN];
-    const capability_slice = std.mem.span(capability);
-    _ = try std.posix.write(termbox.global.ttyfd, capability_slice);
+fn drawHints(buffer: *TerminalBuffer) void {
+    if (buffer.width == 0) return;
+    clearLine(buffer, 0, 0, buffer.width);
+    var x: usize = 0;
+    for (hints) |hint| {
+        if (hint.key.len == 0 or hint.description.len == 0) continue;
+        if (x + hint.key.len >= buffer.width) break;
+        buffer.drawLabel(hint.key, x, 0);
+        x += hint.key.len + 1;
+        if (x + hint.description.len >= buffer.width) break;
+        buffer.drawLabel(hint.description, x, 0);
+        x += hint.description.len + 2;
+    }
 }
 
-fn addOtherEnvironment(session: *Session, lang: Lang, display_server: DisplayServer, exec: ?[]const u8) !void {
-    const name = switch (display_server) {
-        .shell => lang.shell,
-        .xinitrc => lang.xinitrc,
-        else => unreachable,
+fn clearLine(buffer: *TerminalBuffer, x: usize, y: usize, width: usize) void {
+    if (width == 0) return;
+    buffer.drawCharMultiple(' ', x, y, width);
+}
+
+fn wipePassword(password: *Text) void {
+    wipeSecret(password.text.items);
+    password.clear();
+}
+
+fn wipeSecret(secret: []u8) void {
+    if (secret.len == 0) return;
+    @memset(secret, 0);
+}
+
+fn runUnlock(allocator: std.mem.Allocator, password: []const u8) !bool {
+    var child = std.process.Child.init(&[_][]const u8{ "/bin/opal-unlocker" }, allocator);
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+
+    try child.spawn();
+
+    if (child.stdin) |*stdin_file| {
+        var writer = stdin_file.writer();
+        try writer.writeAll(password);
+        try writer.writeByte('\n');
+        try stdin_file.close();
+        child.stdin = null;
+    }
+
+    const result = try child.wait();
+    return switch (result) {
+        .Exited => |code| code == 0,
+        else => false,
     };
-
-    try session.addEnvironment(.{
-        .entry_ini = null,
-        .name = name,
-        .xdg_session_desktop = null,
-        .xdg_desktop_names = null,
-        .cmd = exec,
-        .specifier = lang.other,
-        .display_server = display_server,
-        .is_terminal = display_server == .shell,
-    });
 }
 
-fn crawl(session: *Session, lang: Lang, path: []const u8, display_server: DisplayServer) !void {
-    var iterable_directory = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch return;
-    defer iterable_directory.close();
+fn runCommand(cmd: []const u8) !void {
+    var child = std.process.Child.init(&[_][]const u8{ "/bin/sh", "-c", cmd }, std.heap.page_allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
 
-    var iterator = iterable_directory.iterate();
-    while (try iterator.next()) |item| {
-        if (!std.mem.eql(u8, std.fs.path.extension(item.name), ".desktop")) continue;
-
-        const entry_path = try std.fmt.allocPrint(session.label.allocator, "{s}/{s}", .{ path, item.name });
-        defer session.label.allocator.free(entry_path);
-        var entry_ini = Ini(Entry).init(session.label.allocator);
-        _ = try entry_ini.readFileToStruct(entry_path, .{
-            .fieldHandler = null,
-            .comment_characters = "#",
-        });
-        errdefer entry_ini.deinit();
-
-        const entry = entry_ini.data.@"Desktop Entry";
-        var maybe_xdg_session_desktop: ?[]const u8 = null;
-        var maybe_xdg_desktop_names: ?[]const u8 = null;
-
-        // Prepare the XDG_SESSION_DESKTOP and XDG_CURRENT_DESKTOP environment
-        // variables here
-        if (entry.DesktopNames) |desktop_names| {
-            maybe_xdg_session_desktop = std.mem.sliceTo(desktop_names, ';');
-
-            for (desktop_names) |*c| {
-                if (c.* == ';') c.* = ':';
-            }
-            maybe_xdg_desktop_names = desktop_names;
-        } else if (display_server != .custom) {
-            // If DesktopNames is empty, and this isn't a custom session entry,
-            // we'll take the name of the session file
-            maybe_xdg_session_desktop = std.fs.path.stem(item.name);
-        }
-
-        try session.addEnvironment(.{
-            .entry_ini = entry_ini,
-            .name = entry.Name,
-            .xdg_session_desktop = maybe_xdg_session_desktop,
-            .xdg_desktop_names = maybe_xdg_desktop_names,
-            .cmd = entry.Exec,
-            .specifier = switch (display_server) {
-                .wayland => lang.wayland,
-                .x11 => lang.x11,
-                .custom => lang.custom,
-                else => lang.other,
-            },
-            .display_server = display_server,
-            .is_terminal = entry.Terminal orelse false,
-        });
+    const result = try child.spawnAndWait();
+    switch (result) {
+        .Exited => |code| if (code != 0) return error.CommandFailed,
+        else => return error.CommandFailed,
     }
-}
-
-fn getAllUsernames(allocator: std.mem.Allocator, login_defs_path: []const u8) !StringList {
-    const uid_range = try interop.getUserIdRange(allocator, login_defs_path);
-
-    var usernames: StringList = .empty;
-    var maybe_entry = interop.getNextUsernameEntry();
-
-    while (maybe_entry) |entry| {
-        // We check if the UID is equal to 0 because we always want to add root
-        // as a username (even if you can't log into it)
-        if (entry.uid >= uid_range.uid_min and entry.uid <= uid_range.uid_max or entry.uid == 0 and entry.username != null) {
-            const username = try allocator.dupe(u8, entry.username.?);
-            try usernames.append(allocator, username);
-        }
-
-        maybe_entry = interop.getNextUsernameEntry();
-    }
-
-    interop.closePasswordDatabase();
-    return usernames;
 }
 
 fn adjustBrightness(allocator: std.mem.Allocator, cmd: []const u8) !void {
@@ -1165,59 +349,169 @@ fn adjustBrightness(allocator: std.mem.Allocator, cmd: []const u8) !void {
     brightness.stdout_behavior = .Ignore;
     brightness.stderr_behavior = .Ignore;
 
-    handle_brightness_cmd: {
-        const process_result = brightness.spawnAndWait() catch {
-            break :handle_brightness_cmd;
-        };
-        if (process_result.Exited != 0) {
-            return error.BrightnessChangeFailed;
-        }
+    const process_result = brightness.spawnAndWait() catch return error.BrightnessChangeFailed;
+    switch (process_result) {
+        .Exited => |code| if (code != 0) return error.BrightnessChangeFailed,
+        else => return error.BrightnessChangeFailed,
     }
 }
 
-fn getBatteryPercentage(battery_id: []const u8) !u8 {
-    const path = try std.fmt.allocPrint(temporary_allocator, "/sys/class/power_supply/{s}/capacity", .{battery_id});
-    defer temporary_allocator.free(path);
-
-    const battery_file = try std.fs.cwd().openFile(path, .{});
-    defer battery_file.close();
-
-    var buffer: [8]u8 = undefined;
-    const bytes_read = try battery_file.read(&buffer);
-    const capacity_str = buffer[0..bytes_read];
-
-    const trimmed = std.mem.trimRight(u8, capacity_str, "\n\r");
-
-    return try std.fmt.parseInt(u8, trimmed, 10);
+fn ttyClearScreen() !void {
+    const capability = termbox.global.caps[termbox.TB_CAP_CLEAR_SCREEN];
+    const capability_slice = std.mem.span(capability);
+    _ = try std.posix.write(termbox.global.ttyfd, capability_slice);
 }
 
-fn getAuthErrorMsg(err: anyerror, lang: Lang) []const u8 {
-    return switch (err) {
-        error.GetPasswordNameFailed => lang.err_pwnam,
-        error.GetEnvListFailed => lang.err_envlist,
-        error.XauthFailed => lang.err_xauth,
-        error.XcbConnectionFailed => lang.err_xcb_conn,
-        error.GroupInitializationFailed => lang.err_user_init,
-        error.SetUserGidFailed => lang.err_user_gid,
-        error.SetUserUidFailed => lang.err_user_uid,
-        error.ChangeDirectoryFailed => lang.err_perm_dir,
-        error.TtyControlTransferFailed => lang.err_tty_ctrl,
-        error.SetPathFailed => lang.err_path,
-        error.PamAccountExpired => lang.err_pam_acct_expired,
-        error.PamAuthError => lang.err_pam_auth,
-        error.PamAuthInfoUnavailable => lang.err_pam_authinfo_unavail,
-        error.PamBufferError => lang.err_pam_buf,
-        error.PamCredentialsError => lang.err_pam_cred_err,
-        error.PamCredentialsExpired => lang.err_pam_cred_expired,
-        error.PamCredentialsInsufficient => lang.err_pam_cred_insufficient,
-        error.PamCredentialsUnavailable => lang.err_pam_cred_unavail,
-        error.PamMaximumTries => lang.err_pam_maxtries,
-        error.PamNewAuthTokenRequired => lang.err_pam_authok_reqd,
-        error.PamPermissionDenied => lang.err_pam_perm_denied,
-        error.PamSessionError => lang.err_pam_session,
-        error.PamSystemError => lang.err_pam_sys,
-        error.PamUserUnknown => lang.err_pam_user_unknown,
-        error.PamAbort => lang.err_pam_abort,
-        else => @errorName(err),
-    };
+fn redrawSplashOnExit() void {
+    if (builtin.os.tag != .linux) return;
+    redrawSplashLinux(std.heap.page_allocator) catch {};
+}
+
+fn redrawSplashLinux(allocator: std.mem.Allocator) !void {
+    comptime if (builtin.os.tag != .linux) {
+        return;
+    }
+
+    var splash_file = std.fs.openFileAbsolute("/splash.bmp", .{}) catch return;
+    defer splash_file.close();
+
+    var header: [54]u8 = undefined;
+    const header_read = try splash_file.readAll(&header);
+    if (header_read < header.len) return error.InvalidBmpHeader;
+    if (header[0] != 'B' or header[1] != 'M') return error.InvalidBmpHeader;
+
+    const data_offset = std.mem.readIntLittle(u32, header[10..14]);
+    const dib_header = std.mem.readIntLittle(u32, header[14..18]);
+    if (dib_header < 40) return error.UnsupportedBmpFormat;
+
+    const width_raw = std.mem.readIntLittle(i32, header[18..22]);
+    const height_raw = std.mem.readIntLittle(i32, header[22..26]);
+    const planes = std.mem.readIntLittle(u16, header[26..28]);
+    const bits_per_pixel = std.mem.readIntLittle(u16, header[28..30]);
+
+    if (planes != 1) return error.UnsupportedBmpFormat;
+    if (bits_per_pixel != 24 and bits_per_pixel != 32) return error.UnsupportedBmpFormat;
+
+    const bmp_width = @as(usize, @intCast(@abs(width_raw)));
+    const bmp_height = @as(usize, @intCast(@abs(height_raw)));
+    if (bmp_width == 0 or bmp_height == 0) return error.UnsupportedBmpFormat;
+
+    const top_down = height_raw < 0;
+    const bytes_per_pixel = bits_per_pixel / 8;
+    const row_size = try std.math.mul(usize, bmp_width, bytes_per_pixel);
+    const row_padded = (row_size + 3) & ~@as(usize, 3);
+    const data_size = try std.math.mul(usize, row_padded, bmp_height);
+
+    try splash_file.seekTo(data_offset);
+    var pixel_data = try allocator.alloc(u8, data_size);
+    defer allocator.free(pixel_data);
+    const data_read = try splash_file.readAll(pixel_data);
+    if (data_read < data_size) return error.InvalidBmpData;
+
+    var fb_file = std.fs.openFileAbsolute("/dev/fb0", .{ .mode = .read_write }) catch return;
+    defer fb_file.close();
+
+    const fd = fb_file.handle;
+
+    var fix_info: fb.fb_fix_screeninfo = undefined;
+    if (std.posix.ioctl(fd, fb.FBIOGET_FSCREENINFO, @intFromPtr(&fix_info)) != 0) return error.FramebufferInfoFailed;
+
+    var var_info: fb.fb_var_screeninfo = undefined;
+    if (std.posix.ioctl(fd, fb.FBIOGET_VSCREENINFO, @intFromPtr(&var_info)) != 0) return error.FramebufferInfoFailed;
+
+    if (var_info.bits_per_pixel == 0) return error.FramebufferInfoFailed;
+    const fb_bytes_per_pixel = @as(usize, @intCast(var_info.bits_per_pixel / 8));
+    if (fb_bytes_per_pixel == 0) return error.FramebufferInfoFailed;
+
+    const screen_width = @as(usize, @intCast(var_info.xres));
+    const screen_height = @as(usize, @intCast(var_info.yres));
+    const line_length = @as(usize, @intCast(fix_info.line_length));
+    if (screen_width == 0 or screen_height == 0 or line_length == 0) return error.FramebufferInfoFailed;
+
+    const dest_width = std.math.min(screen_width, bmp_width);
+    const dest_height = std.math.min(screen_height, bmp_height);
+    if (dest_width == 0 or dest_height == 0) return;
+
+    const x_offset = (screen_width - dest_width) / 2;
+    const y_offset = (screen_height - dest_height) / 2;
+    const src_x_offset = (bmp_width - dest_width) / 2;
+    const src_y_offset = (bmp_height - dest_height) / 2;
+
+    var zero_row = try allocator.alloc(u8, line_length);
+    defer allocator.free(zero_row);
+    @memset(zero_row, 0);
+
+    var y: usize = 0;
+    while (y < screen_height) : (y += 1) {
+        const offset = try std.math.mul(usize, y, line_length);
+        try fb_file.pwriteAll(zero_row, offset);
+    }
+
+    const dest_row_bytes = try std.math.mul(usize, dest_width, fb_bytes_per_pixel);
+    var dest_row_buffer = try allocator.alloc(u8, dest_row_bytes);
+    defer allocator.free(dest_row_buffer);
+
+    var dest_row: usize = 0;
+    while (dest_row < dest_height) : (dest_row += 1) {
+        const src_row_index = src_y_offset + dest_row;
+        const adjusted_row = if (top_down) src_row_index else (bmp_height - 1 - src_row_index);
+        const base_row_offset = try std.math.mul(usize, adjusted_row, row_padded);
+        const src_pixel_offset = try std.math.mul(usize, src_x_offset, bytes_per_pixel);
+        const row_start = base_row_offset + src_pixel_offset;
+        const row_length = try std.math.mul(usize, dest_width, bytes_per_pixel);
+        const row_slice = pixel_data[row_start .. row_start + row_length];
+
+        var dest_col: usize = 0;
+        while (dest_col < dest_width) : (dest_col += 1) {
+            const src_index = dest_col * bytes_per_pixel;
+            const b = row_slice[src_index];
+            const g = row_slice[src_index + 1];
+            const r = row_slice[src_index + 2];
+            const a: u8 = if (bytes_per_pixel == 4) row_slice[src_index + 3] else 0xFF;
+
+            const pixel_value = packFramebufferPixel(var_info, fb_bytes_per_pixel, r, g, b, a);
+            const dest_index = dest_col * fb_bytes_per_pixel;
+
+            var byte_index: usize = 0;
+            while (byte_index < fb_bytes_per_pixel) : (byte_index += 1) {
+                dest_row_buffer[dest_index + byte_index] = @as(u8, @truncate(pixel_value >> (byte_index * 8)));
+            }
+        }
+
+        const dest_line_offset = try std.math.mul(usize, y_offset + dest_row, line_length);
+        const dest_pixel_offset = try std.math.mul(usize, x_offset, fb_bytes_per_pixel);
+        const dest_offset = dest_line_offset + dest_pixel_offset;
+        try fb_file.pwriteAll(dest_row_buffer, dest_offset);
+    }
+}
+
+fn packFramebufferPixel(info: fb.fb_var_screeninfo, bytes_per_pixel: usize, r: u8, g: u8, b: u8, a: u8) u64 {
+    comptime if (builtin.os.tag != .linux) {
+        return 0;
+    }
+
+    const red_offset: u6 = @intCast(std.math.min(u32, info.red.offset, 63));
+    const green_offset: u6 = @intCast(std.math.min(u32, info.green.offset, 63));
+    const blue_offset: u6 = @intCast(std.math.min(u32, info.blue.offset, 63));
+    const alpha_offset: u6 = @intCast(std.math.min(u32, info.transp.offset, 63));
+
+    const red = scaleComponent(r, info.red.length) << red_offset;
+    const green = scaleComponent(g, info.green.length) << green_offset;
+    const blue = scaleComponent(b, info.blue.length) << blue_offset;
+    const alpha = scaleComponent(a, info.transp.length) << alpha_offset;
+
+    var pixel: u64 = red | green | blue | alpha;
+    if (bytes_per_pixel <= 4) {
+        const bits: u6 = @intCast(std.math.min(usize, bytes_per_pixel * 8, 64));
+        const mask = if (bits == 64) std.math.maxInt(u64) else (@as(u64, 1) << bits) - 1;
+        return pixel & mask;
+    }
+    return pixel;
+}
+
+fn scaleComponent(value: u8, length: u32) u64 {
+    if (length == 0) return 0;
+    const bits: u6 = @intCast(std.math.min(u32, length, 63));
+    const max_value: u64 = (@as(u64, 1) << bits) - 1;
+    return (max_value * value + 127) / 255;
 }
